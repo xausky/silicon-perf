@@ -1,0 +1,121 @@
+name: Tauri CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            archive_ext: tar.gz
+          - runner: windows-2025
+            platform: windows
+            archive_ext: zip
+          - runner: macos-15
+            platform: macos
+            archive_ext: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install pnpm runtime
+        run: npm install -g pnpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build desktop app (no installer)
+        run: npm run tauri build -- --no-bundle
+
+      - name: Package binary artifact
+        id: package
+        shell: pwsh
+        run: |
+          $binName = "silicon-perf"
+          $releaseDir = "src-tauri/target/release"
+          $distDir = "dist"
+          New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+
+          if ($IsWindows) {
+            $binPath = Join-Path $releaseDir "$binName.exe"
+            if (!(Test-Path $binPath)) { throw "Binary not found: $binPath" }
+            $outFile = Join-Path $distDir "$binName-${{ matrix.platform }}-${{ runner.arch }}.${{ matrix.archive_ext }}"
+            Compress-Archive -Path $binPath -DestinationPath $outFile -Force
+          } else {
+            $binPath = Join-Path $releaseDir $binName
+            if (!(Test-Path $binPath)) { throw "Binary not found: $binPath" }
+            $outFile = Join-Path $distDir "$binName-${{ matrix.platform }}-${{ runner.arch }}.${{ matrix.archive_ext }}"
+            tar -czf $outFile -C $releaseDir $binName
+          }
+
+          "artifact_file=$outFile" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: silicon-perf-${{ matrix.platform }}-${{ runner.arch }}
+          path: ${{ steps.package.outputs.artifact_file }}
+          if-no-files-found: error
+
+  release:
+    name: Draft Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create draft release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: release-assets/*
