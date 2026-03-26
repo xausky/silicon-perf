@@ -13,7 +13,7 @@ silicon-perf 用来做 LLM API 的快速对比测试：
 
 ## 截图
 
-![9b5827070da8ffaaf26205786cf40820.png](https://i.mji.rip/2026/03/26/9b5827070da8ffaaf26205786cf40820.png)
+![080890718d4604573d08b490111359a0.png](https://i.mji.rip/2026/03/26/080890718d4604573d08b490111359a0.png)
 
 ## 你能做什么
 
