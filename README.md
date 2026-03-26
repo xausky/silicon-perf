@@ -1,7 +1,106 @@
-# Tauri + SvelteKit
+# silicon-perf
 
-This template should help get you started developing with Tauri and SvelteKit in Vite.
+一个面向 OpenAI 兼容接口的桌面端压测工具。适合对比不同网关、不同模型在同一提示词下的响应性能。
 
-## Recommended IDE Setup
+## 这是什么
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+silicon-perf 用来做 LLM API 的快速对比测试：
+
+- 配置多个 `baseUrl + apiKey + models`
+- 一次并发跑完所有组合
+- 输出聚合后的性能指标（首字、输出）
+- 支持失败轮次重试与配置导入导出
+
+## 你能做什么
+
+- **多线路对比**：同一模型在不同 endpoint 下的表现对比
+- **多模型对比**：同一 endpoint 下不同模型的表现对比
+- **多轮稳定性观察**：看平均值和波动区间，不只看单次结果
+- **失败追测**：对失败项一键重试，可只重试失败轮次
+
+## 结果怎么看
+
+结果表每行是一个 `Endpoint + Model` 组合（不是每轮一行）。
+
+- **首字**：首 token 响应时间平均值 + 偏差
+  - 例如：`1.20(-0.10,+0.18)s`
+- **输出**：输出速度平均值 + 偏差
+  - 例如：`45.3(-6.1,+4.2)tok/s`
+- **状态**：`测试中 / 成功 / 失败`，并显示成功轮次比
+  - 例如：`成功 (3/3)`、`失败 (2/3)`
+- **结果**：点击“查看”可看每轮分段结果（成功响应或失败报错）
+
+## 使用步骤
+
+### 1) 配置测试对象
+
+在左侧“测试配置”里填写：
+
+- `名称`（可选）
+- `Base URL`（如 `https://api.openai.com/v1`）
+- `API Key`
+- `Models`（逗号或换行分隔）
+
+可添加多个 endpoint。
+
+### 2) 配置测试参数
+
+- `轮次`
+- `并发`
+- `MaxTokens`
+- `Temperature`
+- `User-Agent`（默认 `silicon-perf/<version>`，可改）
+- `提示词`
+
+### 3) 开始测试
+
+点击“开始测试”后，结果会实时刷新，不用等全部结束。
+
+### 4) 重试
+
+在结果行点击“重试”：
+
+- 默认按当前配置重跑该行
+- 若该行有失败轮次，会提示是否“只重试失败轮次”
+
+## 配置导入导出
+
+- **导出**：点击“导出”，使用系统“另存为”选择路径
+- **导入**：点击“导入”选择 JSON，自动回填配置
+
+建议把常用测试集保存为多个配置文件，方便团队复用。
+
+## 注意事项
+
+- 仅支持 OpenAI 兼容格式接口
+- 请妥善保管 API Key，不建议把配置文件提交到公开仓库
+- 若服务端未返回标准 usage，输出速度会采用文本估算
+- 已加入单请求超时兜底，避免长期卡在“测试中”
+
+---
+
+## 面向开发者（简版）
+
+- 前端：`src/routes/+page.svelte`
+- Tauri 后端：`src-tauri/src/lib.rs`
+- CI：`.github/workflows/tauri-ci.yml`
+
+本地开发：
+
+```bash
+npm install
+npm run tauri dev
+```
+
+检查：
+
+```bash
+npm run check
+cargo check --manifest-path src-tauri/Cargo.toml
+```
+
+Tag（`v*`）会触发三端构建并创建 Draft Release。
+
+## License
+
+MIT

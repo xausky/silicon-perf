@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { save } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
 
@@ -21,11 +22,19 @@
     endpointName: string;
     baseUrl: string;
     model: string;
-    round: number;
+    rounds: number;
     status: "测试中" | "成功" | "失败";
     firstTokenLatencySecs: number | null;
+    firstTokenMinusSecs: number | null;
+    firstTokenPlusSecs: number | null;
     outputSpeedTps: number | null;
+    outputMinusTps: number | null;
+    outputPlusTps: number | null;
     success: boolean | null;
+    successCount: number;
+    failCount: number;
+    failedRounds: number[];
+    roundResults: BenchmarkResult[];
     result: string;
   };
 
@@ -42,10 +51,23 @@
     result: string;
   };
 
+  type BenchmarkProgress = {
+    item: BenchmarkResult;
+    completed: number;
+    total: number;
+  };
+
+  type RunSettings = {
+    normalizedEndpoints: EndpointRequest[];
+    safeRounds: number;
+    safeConcurrency: number;
+    safeMaxTokens: number;
+  };
+
   type SortDirection = "asc" | "desc";
   type SortKey = keyof Pick<
     ResultRow,
-    "endpointName" | "model" | "round" | "firstTokenLatencySecs" | "outputSpeedTps" | "result" | "status"
+    "endpointName" | "model" | "firstTokenLatencySecs" | "outputSpeedTps" | "result" | "status"
   >;
 
   type SavedConfig = {
@@ -66,15 +88,23 @@
     modelsInput: "gpt-4o-mini"
   });
 
-  const createRow = (endpoint: EndpointRequest, model: string, round: number): ResultRow => ({
+  const createRow = (endpoint: EndpointRequest, model: string, rounds: number): ResultRow => ({
     endpointName: endpoint.name.trim() || endpoint.baseUrl.trim() || "未命名",
     baseUrl: endpoint.baseUrl.trim(),
     model,
-    round,
+    rounds,
     status: "测试中",
     firstTokenLatencySecs: null,
+    firstTokenMinusSecs: null,
+    firstTokenPlusSecs: null,
     outputSpeedTps: null,
+    outputMinusTps: null,
+    outputPlusTps: null,
     success: null,
+    successCount: 0,
+    failCount: 0,
+    failedRounds: [],
+    roundResults: [],
     result: ""
   });
 
@@ -119,24 +149,264 @@
     endpoints = endpoints.map((endpoint, i) => (i === index ? { ...endpoint, [field]: value } : endpoint));
   }
 
-  function formatLatency(value: number | null) {
-    if (value == null) return "-";
-    return `${value.toFixed(2)} s`;
-  }
-
-  function formatSpeed(value: number | null) {
-    if (value == null) return "-";
-    return `${value.toFixed(1)} tok/s`;
-  }
-
   function openDetail(row: ResultRow) {
-    detailTitle = `${row.endpointName} / ${row.model} / 第 ${row.round} 轮`;
+    detailTitle = `${row.endpointName} / ${row.model} / ${row.rounds} 轮汇总`;
     detailContent = row.result || "(空)";
     detailOpen = true;
   }
 
   function closeDetail() {
     detailOpen = false;
+  }
+
+  function buildComboKey(endpointName: string, baseUrl: string, model: string) {
+    return `${endpointName}|||${baseUrl}|||${model}`;
+  }
+
+  function summarizeMetric(values: number[]) {
+    if (values.length === 0) {
+      return { avg: null, minus: null, plus: null };
+    }
+    const total = values.reduce((acc, value) => acc + value, 0);
+    const avg = total / values.length;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    return {
+      avg,
+      minus: min - avg,
+      plus: max - avg
+    };
+  }
+
+  function summarizeRowFromRounds(
+    row: ResultRow,
+    byRound: Map<number, BenchmarkResult>,
+    totalRounds: number,
+    finalizeMissing = false
+  ): ResultRow {
+    const items = Array.from(byRound.values())
+      .filter((x) => x.round >= 1 && x.round <= totalRounds)
+      .sort((a, b) => a.round - b.round);
+    const successCount = items.filter((x) => x.success).length;
+    const failCount = items.filter((x) => !x.success).length;
+    const failedRounds = items.filter((x) => !x.success).map((x) => x.round);
+    const doneCount = byRound.size;
+
+    const firstValues = items
+      .map((x) => x.firstTokenLatencySecs)
+      .filter((x): x is number => typeof x === "number");
+    const outputValues = items.map((x) => x.outputSpeedTps).filter((x): x is number => typeof x === "number");
+
+    const firstSummary = summarizeMetric(firstValues);
+    const outputSummary = summarizeMetric(outputValues);
+
+    const mergedResult = Array.from({ length: totalRounds }, (_, idx) => {
+      const round = idx + 1;
+      const item = byRound.get(round);
+      if (!item) {
+        if (finalizeMissing) {
+          return `【第${round}轮｜失败】\n未收到该轮结果（可能超时或事件丢失）`;
+        }
+        return `【第${round}轮｜测试中】\n等待结果...`;
+      }
+      return `【第${round}轮｜${item.status}】\n${item.result || "(空)"}`;
+    }).join("\n\n-----\n\n");
+
+    const missingCount = Math.max(0, totalRounds - doneCount);
+    const mergedFailCount = failCount + (finalizeMissing ? missingCount : 0);
+    const status: ResultRow["status"] =
+      !finalizeMissing && doneCount < totalRounds ? "测试中" : mergedFailCount > 0 ? "失败" : "成功";
+
+    return {
+      ...row,
+      status,
+      success: !finalizeMissing && doneCount < totalRounds ? null : mergedFailCount === 0,
+      successCount,
+      failCount: mergedFailCount,
+      failedRounds,
+      roundResults: items,
+      firstTokenLatencySecs: firstSummary.avg,
+      firstTokenMinusSecs: firstSummary.minus,
+      firstTokenPlusSecs: firstSummary.plus,
+      outputSpeedTps: outputSummary.avg,
+      outputMinusTps: outputSummary.minus,
+      outputPlusTps: outputSummary.plus,
+      result: mergedResult
+    };
+  }
+
+  function getEndpointDisplayName(endpoint: EndpointRequest) {
+    return endpoint.name.trim() || endpoint.baseUrl.trim() || "未命名";
+  }
+
+  function buildRunSettings(): RunSettings | null {
+    const normalizedEndpoints: EndpointRequest[] = endpoints
+      .map((item) => ({
+        name: item.name.trim(),
+        baseUrl: item.baseUrl.trim(),
+        apiKey: item.apiKey.trim(),
+        models: parseModels(item.modelsInput)
+      }))
+      .filter((item) => item.baseUrl && item.apiKey && item.models.length > 0);
+
+    if (normalizedEndpoints.length === 0) {
+      errorMessage = "请至少填写一组完整的 baseUrl + key + model。";
+      return null;
+    }
+
+    if (!prompt.trim()) {
+      errorMessage = "提示词不能为空。";
+      return null;
+    }
+
+    return {
+      normalizedEndpoints,
+      safeRounds: Number(rounds) > 0 ? Number(rounds) : 1,
+      safeConcurrency: Number(concurrency) > 0 ? Number(concurrency) : 1,
+      safeMaxTokens: Number(maxTokens) > 0 ? Number(maxTokens) : 512
+    };
+  }
+
+  async function runBenchmarkWithStream(
+    normalizedEndpoints: EndpointRequest[],
+    safeRounds: number,
+    safeConcurrency: number,
+    safeMaxTokens: number,
+    retryRounds: number[] | null,
+    onProgress: (item: BenchmarkResult) => void
+  ): Promise<{ completed: number; total: number }> {
+    let unlistenProgress: null | (() => void) = null;
+    let latestProgress = { completed: 0, total: 0 };
+    try {
+      unlistenProgress = await listen<BenchmarkProgress>("benchmark-progress", (event) => {
+        latestProgress = {
+          completed: event.payload.completed,
+          total: event.payload.total
+        };
+        onProgress(event.payload.item);
+      });
+
+      await invoke("run_benchmark", {
+        request: {
+          endpoints: normalizedEndpoints,
+          prompt,
+          rounds: safeRounds,
+          concurrency: safeConcurrency,
+          maxTokens: safeMaxTokens,
+          temperature: Number(temperature),
+          userAgent,
+          retryRounds
+        }
+      });
+      return latestProgress;
+    } finally {
+      if (unlistenProgress) {
+        unlistenProgress();
+      }
+    }
+  }
+
+  async function retryRow(targetRow: ResultRow) {
+    if (running) return;
+    errorMessage = "";
+
+    const settings = buildRunSettings();
+    if (!settings) {
+      return;
+    }
+
+    const { normalizedEndpoints, safeRounds, safeConcurrency, safeMaxTokens } = settings;
+    const matchedEndpoint = normalizedEndpoints.find(
+      (endpoint) =>
+        endpoint.baseUrl === targetRow.baseUrl &&
+        getEndpointDisplayName(endpoint) === targetRow.endpointName &&
+        endpoint.models.includes(targetRow.model)
+    );
+
+    if (!matchedEndpoint) {
+      errorMessage = "重试失败：当前配置中找不到该结果对应的 endpoint/model 组合。";
+      return;
+    }
+
+    const retryEndpoint: EndpointRequest = {
+      ...matchedEndpoint,
+      models: [targetRow.model]
+    };
+    const rowKey = buildComboKey(targetRow.endpointName, targetRow.baseUrl, targetRow.model);
+    const canRetryFailedOnly = targetRow.failCount > 0 && targetRow.failCount < targetRow.rounds;
+    const retryFailedOnly =
+      canRetryFailedOnly &&
+      window.confirm(`检测到 ${targetRow.failCount} 个失败轮次，是否仅重试失败轮次？\n选择“取消”将重试全部轮次。`);
+    const retryRounds = retryFailedOnly ? [...targetRow.failedRounds] : null;
+
+    const groupedRounds = new Map<number, BenchmarkResult>();
+    if (retryFailedOnly) {
+      for (const item of targetRow.roundResults) {
+        if (item.success && item.round <= safeRounds) {
+          groupedRounds.set(item.round, item);
+        }
+      }
+    }
+
+    rows = rows.map((row) => {
+      const key = buildComboKey(row.endpointName, row.baseUrl, row.model);
+      if (key !== rowKey) {
+        return row;
+      }
+      const reset = createRow(
+        {
+          name: row.endpointName,
+          baseUrl: row.baseUrl,
+          apiKey: matchedEndpoint.apiKey,
+          models: [row.model]
+        },
+        row.model,
+        safeRounds
+      );
+      return summarizeRowFromRounds(reset, groupedRounds, safeRounds, false);
+    });
+
+    running = true;
+    try {
+      const progress = await runBenchmarkWithStream(
+        [retryEndpoint],
+        safeRounds,
+        safeConcurrency,
+        safeMaxTokens,
+        retryRounds,
+        (item) => {
+        const itemKey = buildComboKey(item.endpointName, item.baseUrl, item.model);
+        if (itemKey !== rowKey) {
+          return;
+        }
+        groupedRounds.set(item.round, item);
+        rows = rows.map((row) => {
+          const key = buildComboKey(row.endpointName, row.baseUrl, row.model);
+          if (key !== rowKey) {
+            return row;
+          }
+          return summarizeRowFromRounds(row, groupedRounds, safeRounds, false);
+        });
+        }
+      );
+
+      const expected = retryRounds?.length ?? safeRounds;
+      const completed = Math.max(progress.completed, groupedRounds.size);
+      const shouldFinalize = completed >= expected;
+
+      rows = rows.map((row) => {
+        const key = buildComboKey(row.endpointName, row.baseUrl, row.model);
+        if (key !== rowKey) {
+          return row;
+        }
+        return summarizeRowFromRounds(row, groupedRounds, safeRounds, shouldFinalize);
+      });
+    } catch (error: unknown) {
+      const message = typeof error === "string" ? error : error instanceof Error ? error.message : "未知错误";
+      errorMessage = `重试失败：${message}`;
+    } finally {
+      running = false;
+    }
   }
 
   function toggleSort(key: SortKey) {
@@ -171,9 +441,6 @@
     return list.sort((a, b) => {
       let delta = 0;
       switch (sortKey) {
-        case "round":
-          delta = a.round - b.round;
-          break;
         case "firstTokenLatencySecs":
           delta = compareNullableNumber(a.firstTokenLatencySecs, b.firstTokenLatencySecs);
           break;
@@ -192,8 +459,20 @@
       if (delta !== 0) {
         return delta * factor;
       }
-      return a.round - b.round;
+      return a.model.localeCompare(b.model, "zh-CN");
     });
+  }
+
+  function formatLatency(avg: number | null, minus: number | null, plus: number | null) {
+    if (avg == null) return "-";
+    if (minus == null || plus == null) return `${avg.toFixed(2)} s`;
+    return `${avg.toFixed(2)}(${minus.toFixed(2)},+${plus.toFixed(2)})s`;
+  }
+
+  function formatSpeed(avg: number | null, minus: number | null, plus: number | null) {
+    if (avg == null) return "-";
+    if (minus == null || plus == null) return `${avg.toFixed(1)} tok/s`;
+    return `${avg.toFixed(1)}(${minus.toFixed(1)},+${plus.toFixed(1)})tok/s`;
   }
 
   async function exportConfig() {
@@ -287,71 +566,51 @@
     if (running) return;
     errorMessage = "";
 
-    const normalizedEndpoints: EndpointRequest[] = endpoints
-      .map((item) => ({
-        name: item.name.trim(),
-        baseUrl: item.baseUrl.trim(),
-        apiKey: item.apiKey.trim(),
-        models: parseModels(item.modelsInput)
-      }))
-      .filter((item) => item.baseUrl && item.apiKey && item.models.length > 0);
-
-    if (normalizedEndpoints.length === 0) {
-      errorMessage = "请至少填写一组完整的 baseUrl + key + model。";
+    const settings = buildRunSettings();
+    if (!settings) {
       return;
     }
-
-    if (!prompt.trim()) {
-      errorMessage = "提示词不能为空。";
-      return;
-    }
-
-    const safeRounds = Number(rounds) > 0 ? Number(rounds) : 1;
-    const safeConcurrency = Number(concurrency) > 0 ? Number(concurrency) : 1;
-    const safeMaxTokens = Number(maxTokens) > 0 ? Number(maxTokens) : 512;
+    const { normalizedEndpoints, safeRounds, safeConcurrency, safeMaxTokens } = settings;
 
     const initialRows: ResultRow[] = [];
     for (const endpoint of normalizedEndpoints) {
       for (const model of endpoint.models) {
-        for (let round = 1; round <= safeRounds; round++) {
-          initialRows.push(createRow(endpoint, model, round));
-        }
+        initialRows.push(createRow(endpoint, model, safeRounds));
       }
     }
-    rows = initialRows;
+    rows = initialRows.map((row) => summarizeRowFromRounds(row, new Map<number, BenchmarkResult>(), safeRounds, false));
 
     running = true;
     try {
-      const results = await invoke<BenchmarkResult[]>("run_benchmark", {
-        request: {
-          endpoints: normalizedEndpoints,
-          prompt,
-          rounds: safeRounds,
-          concurrency: safeConcurrency,
-          maxTokens: safeMaxTokens,
-          temperature: Number(temperature),
-          userAgent
-        }
-      });
+      const groupedRounds = new Map<string, Map<number, BenchmarkResult>>();
+      const progress = await runBenchmarkWithStream(
+        normalizedEndpoints,
+        safeRounds,
+        safeConcurrency,
+        safeMaxTokens,
+        null,
+        (item) => {
+        const key = buildComboKey(item.endpointName, item.baseUrl, item.model);
+        const byRound = groupedRounds.get(key) ?? new Map<number, BenchmarkResult>();
+        byRound.set(item.round, item);
+        groupedRounds.set(key, byRound);
 
-      rows = initialRows.map((row, index) => {
-        const hit = results[index];
-        if (!hit) {
-          return {
-            ...row,
-            status: "失败",
-            success: false,
-            result: "未收到该项测试结果"
-          };
+        rows = rows.map((row) => {
+          const rowKey = buildComboKey(row.endpointName, row.baseUrl, row.model);
+          if (rowKey !== key) {
+            return row;
+          }
+          return summarizeRowFromRounds(row, byRound, safeRounds, false);
+        });
         }
-        return {
-          ...row,
-          status: hit.status,
-          success: hit.success,
-          result: hit.result,
-          firstTokenLatencySecs: hit.firstTokenLatencySecs,
-          outputSpeedTps: hit.outputSpeedTps
-        };
+      );
+
+      const shouldFinalize = progress.total > 0 && progress.completed >= progress.total;
+
+      rows = rows.map((row) => {
+        const key = buildComboKey(row.endpointName, row.baseUrl, row.model);
+        const byRound = groupedRounds.get(key) ?? new Map<number, BenchmarkResult>();
+        return summarizeRowFromRounds(row, byRound, safeRounds, shouldFinalize);
       });
     } catch (error: unknown) {
       const message =
@@ -361,7 +620,20 @@
             ? error.message
             : "未知错误";
       errorMessage = `测试启动失败：${message}`;
-      rows = rows.map((row) => ({ ...row, status: "失败", success: false, result: message }));
+      rows = rows.map((row) => {
+        const failedResult = Array.from({ length: row.rounds }, (_, idx) => `【第${idx + 1}轮｜失败】\n${message}`).join(
+          "\n\n-----\n\n"
+        );
+        return {
+          ...row,
+          status: "失败",
+          success: false,
+          failCount: row.rounds,
+          failedRounds: Array.from({ length: row.rounds }, (_, idx) => idx + 1),
+          roundResults: [],
+          result: failedResult
+        };
+      });
     } finally {
       running = false;
     }
@@ -486,7 +758,6 @@
             <tr>
               <th><button type="button" class="th-btn" onclick={() => toggleSort("endpointName")}>Endpoint {sortSymbol("endpointName")}</button></th>
               <th><button type="button" class="th-btn" onclick={() => toggleSort("model")}>Model {sortSymbol("model")}</button></th>
-              <th><button type="button" class="th-btn" onclick={() => toggleSort("round")}>轮次 {sortSymbol("round")}</button></th>
               <th>
                 <button type="button" class="th-btn" onclick={() => toggleSort("firstTokenLatencySecs")}>
                   首字 {sortSymbol("firstTokenLatencySecs")}
@@ -500,22 +771,24 @@
           <tbody>
             {#if rows.length === 0}
               <tr>
-                <td colspan="7" class="empty">暂无结果，先配置后开始测试。</td>
+                <td colspan="6" class="empty">暂无结果，先配置后开始测试。</td>
               </tr>
             {:else}
               {#each getSortedRows() as row}
                 <tr>
                   <td>{row.endpointName}</td>
                   <td>{row.model}</td>
-                  <td>{row.round}</td>
-                  <td>{formatLatency(row.firstTokenLatencySecs)}</td>
-                  <td>{formatSpeed(row.outputSpeedTps)}</td>
+                  <td>{formatLatency(row.firstTokenLatencySecs, row.firstTokenMinusSecs, row.firstTokenPlusSecs)}</td>
+                  <td>{formatSpeed(row.outputSpeedTps, row.outputMinusTps, row.outputPlusTps)}</td>
                   <td>
-                    <button type="button" class="link" onclick={() => openDetail(row)}>点击查看</button>
+                    <div class="cell-actions">
+                      <button type="button" class="link" onclick={() => openDetail(row)}>查看</button>
+                      <button type="button" class="link" disabled={running} onclick={() => retryRow(row)}>重试</button>
+                    </div>
                   </td>
                   <td>
                     <span class={`badge ${row.status === "成功" ? "ok" : row.status === "失败" ? "fail" : "running"}`}>
-                      {row.status}
+                      {row.status} ({row.successCount}/{row.rounds})
                     </span>
                   </td>
                 </tr>

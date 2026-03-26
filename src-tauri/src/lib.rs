@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
+use tauri::Emitter;
 use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,6 +29,7 @@ struct BenchmarkRequest {
     max_tokens: Option<u32>,
     temperature: Option<f64>,
     user_agent: Option<String>,
+    retry_rounds: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,7 +42,7 @@ struct BenchmarkTask {
     round: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BenchmarkResult {
     index: usize,
@@ -52,6 +55,14 @@ struct BenchmarkResult {
     first_token_latency_secs: Option<f64>,
     output_speed_tps: Option<f64>,
     result: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BenchmarkProgress {
+    item: BenchmarkResult,
+    completed: usize,
+    total: usize,
 }
 
 fn normalize_base_url(raw: &str) -> String {
@@ -288,7 +299,7 @@ async fn run_single_task(
 }
 
 #[tauri::command]
-async fn run_benchmark(request: BenchmarkRequest) -> Result<Vec<BenchmarkResult>, String> {
+async fn run_benchmark(app: tauri::AppHandle, request: BenchmarkRequest) -> Result<(), String> {
     if request.endpoints.is_empty() {
         return Err("请至少配置一个 endpoint".to_string());
     }
@@ -297,7 +308,14 @@ async fn run_benchmark(request: BenchmarkRequest) -> Result<Vec<BenchmarkResult>
     }
 
     let rounds = request.rounds.max(1);
-    let mut tasks = Vec::new();
+    let retry_rounds: Option<Vec<u32>> = request.retry_rounds.as_ref().map(|list| {
+        list.iter()
+            .copied()
+            .filter(|r| *r >= 1 && *r <= rounds)
+            .collect()
+    });
+    let mut endpoint_buckets: Vec<Vec<BenchmarkTask>> = Vec::new();
+    let mut next_index = 0usize;
 
     for endpoint in &request.endpoints {
         let endpoint_name = endpoint
@@ -306,17 +324,43 @@ async fn run_benchmark(request: BenchmarkRequest) -> Result<Vec<BenchmarkResult>
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| endpoint.base_url.clone());
 
+        let mut bucket = Vec::new();
         for model in endpoint.models.iter().filter(|m| !m.trim().is_empty()) {
-            for round in 1..=rounds {
-                tasks.push(BenchmarkTask {
-                    index: tasks.len(),
+            let round_list: Vec<u32> = match &retry_rounds {
+                Some(list) if !list.is_empty() => list.clone(),
+                _ => (1..=rounds).collect(),
+            };
+
+            for round in round_list {
+                bucket.push(BenchmarkTask {
+                    index: next_index,
                     endpoint_name: endpoint_name.clone(),
                     base_url: endpoint.base_url.clone(),
                     api_key: endpoint.api_key.clone(),
                     model: model.trim().to_string(),
                     round,
                 });
+                next_index += 1;
             }
+        }
+
+        if !bucket.is_empty() {
+            endpoint_buckets.push(bucket);
+        }
+    }
+
+    let mut tasks = Vec::new();
+    let mut cursor = 0usize;
+    while !endpoint_buckets.is_empty() {
+        if cursor >= endpoint_buckets.len() {
+            cursor = 0;
+        }
+
+        if let Some(task) = endpoint_buckets[cursor].pop() {
+            tasks.push(task);
+            cursor += 1;
+        } else {
+            endpoint_buckets.remove(cursor);
         }
     }
 
@@ -333,28 +377,71 @@ async fn run_benchmark(request: BenchmarkRequest) -> Result<Vec<BenchmarkResult>
         .build()
         .map_err(|e| format!("初始化 HTTP 客户端失败: {e}"))?;
 
+    let total = tasks.len();
     let request = Arc::new(request);
+    const TASK_TIMEOUT_SECS: u64 = 300;
 
-    let mut results: Vec<BenchmarkResult> = stream::iter(tasks)
+    let mut stream = stream::iter(tasks)
         .map(|task| {
             let semaphore = Arc::clone(&semaphore);
             let client = client.clone();
             let request = Arc::clone(&request);
             let user_agent = Arc::clone(&user_agent);
             async move {
-                let _permit = semaphore.acquire_owned().await.map_err(|e| e.to_string())?;
-                Ok::<BenchmarkResult, String>(
-                    run_single_task(&client, task, &request, user_agent.as_str()).await,
-                )
+                let permit = semaphore.acquire_owned().await;
+                match permit {
+                    Ok(_permit) => {
+                        match tokio::time::timeout(
+                            Duration::from_secs(TASK_TIMEOUT_SECS),
+                            run_single_task(&client, task.clone(), &request, user_agent.as_str()),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => BenchmarkResult {
+                                index: task.index,
+                                endpoint_name: task.endpoint_name,
+                                base_url: task.base_url,
+                                model: task.model,
+                                round: task.round,
+                                success: false,
+                                status: "失败".to_string(),
+                                first_token_latency_secs: None,
+                                output_speed_tps: None,
+                                result: format!("请求超时（>{}s）", TASK_TIMEOUT_SECS),
+                            },
+                        }
+                    }
+                    Err(e) => BenchmarkResult {
+                        index: task.index,
+                        endpoint_name: task.endpoint_name,
+                        base_url: task.base_url,
+                        model: task.model,
+                        round: task.round,
+                        success: false,
+                        status: "失败".to_string(),
+                        first_token_latency_secs: None,
+                        output_speed_tps: None,
+                        result: format!("并发控制失败: {e}"),
+                    },
+                }
             }
         })
-        .buffer_unordered(concurrency)
-        .filter_map(|item| async move { item.ok() })
-        .collect()
-        .await;
+        .buffer_unordered(concurrency);
 
-    results.sort_by_key(|r| r.index);
-    Ok(results)
+    let mut completed = 0usize;
+    while let Some(item) = stream.next().await {
+        completed += 1;
+        let payload = BenchmarkProgress {
+            item,
+            completed,
+            total,
+        };
+        let _ = app.emit("benchmark-progress", payload);
+    }
+
+    let _ = app.emit("benchmark-finished", json!({ "total": total }));
+    Ok(())
 }
 
 #[tauri::command]
